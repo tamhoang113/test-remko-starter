@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
-# ci-setup-sdk.sh <dxp-clients-branch>
+# ci-setup-sdk.sh <dxp-clients-branch> [project-folder]
 #
 # Clones remkoj/optimizely-dxp-clients at the given branch,
-# builds it, packs each @remkoj/* package to .packages/*.tgz,
-# then rewrites package.json to use file: paths so Vercel can
+# builds it, packs each @remkoj/* package to <project-folder>/.packages/*.tgz,
+# then rewrites <project-folder>/package.json to use file: paths so Vercel can
 # install from the committed tarballs.
 set -euo pipefail
 
 BRANCH="${1:-}"
+FOLDER="${2:-.}"
+
 if [ -z "$BRANCH" ]; then
-  echo "Usage: ci-setup-sdk.sh <branch>" >&2
+  echo "Usage: ci-setup-sdk.sh <branch> [project-folder]" >&2
   exit 1
 fi
 
 WORKSPACE="$(pwd)"
+PROJECT_DIR="$WORKSPACE/$FOLDER"
 DXP_DIR="$WORKSPACE/dxp-clients"
 
 echo "==> Cloning optimizely-dxp-clients @ $BRANCH"
@@ -33,7 +36,7 @@ cd "$DXP_DIR"
 corepack yarn install
 corepack yarn prepare 2>/dev/null || corepack yarn build
 
-echo "==> Packing tarballs into .packages/"
+echo "==> Packing tarballs into $FOLDER/.packages/"
 PACKAGES=(
   optimizely-cms-nextjs
   optimizely-cms-react
@@ -43,20 +46,20 @@ PACKAGES=(
   optimizely-graph-functions
 )
 
-mkdir -p "$WORKSPACE/.packages"
+mkdir -p "$PROJECT_DIR/.packages"
 for PKG in "${PACKAGES[@]}"; do
   PKG_DIR="$DXP_DIR/packages/$PKG"
   if [ -d "$PKG_DIR" ]; then
     cd "$PKG_DIR"
-    corepack yarn pack --out "$WORKSPACE/.packages/$PKG.tgz"
-    echo "  packed: .packages/$PKG.tgz"
+    corepack yarn pack --out "$PROJECT_DIR/.packages/$PKG.tgz"
+    echo "  packed: $FOLDER/.packages/$PKG.tgz"
   else
     echo "  skip (not found): packages/$PKG"
   fi
 done
 
-echo "==> Updating package.json with file: paths"
-cd "$WORKSPACE"
+echo "==> Updating $FOLDER/package.json with file: paths"
+cd "$PROJECT_DIR"
 node - <<'NODE_EOF'
 const fs = require('fs');
 const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
@@ -96,4 +99,4 @@ fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 console.log('  package.json updated with file: tarball paths');
 NODE_EOF
 
-echo "==> SDK setup complete (branch: $BRANCH)"
+echo "==> SDK setup complete (branch: $BRANCH, folder: $FOLDER)"
