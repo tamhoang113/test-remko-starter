@@ -1,0 +1,19 @@
+# env — never commit
+.env
+.env.local
+.env.*.local
+
+# deps
+node_modules/
+
+# dxp-clients clone (CI uses .packages/ tarballs instead)
+dxp-clients/
+optimizely-dxp-clients/
+
+# Next.js build output (Vercel builds this)
+.next/
+out/
+
+# misc
+.DS_Store
+*.log

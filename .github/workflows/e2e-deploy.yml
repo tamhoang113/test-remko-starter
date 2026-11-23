@@ -1,0 +1,261 @@
+# ============================================================
+# [QA] Remko SDK — E2E Deploy to Vercel
+# ============================================================
+# ONE-TIME SETUP (manual, before first run):
+#
+#   1. Create TWO Vercel projects connected to this repo:
+#        remko-prod  → watches branch: main-prod
+#        remko-test  → watches branch: main-test
+#      In each Vercel project dashboard, add the env vars for
+#      that site (CMS URL, client id/secret, graph keys, etc.)
+#      so they are available during Vercel's own build.
+#
+#   2. Add these GitHub Secrets to this repo
+#      (Settings → Secrets → Actions):
+#
+#      Shared:
+#        GH_PAT                   Personal Access Token, repo write scope
+#        VERCEL_TOKEN             Vercel API token
+#        VERCEL_ORG_ID            Vercel team/personal org ID
+#
+#      Production site:
+#        PROD_CMS_URL             e.g. https://app-xxx.cms.optimizely.com/
+#        PROD_CLIENT_ID
+#        PROD_CLIENT_SECRET
+#        PROD_GRAPH_SECRET
+#        PROD_GRAPH_APP_KEY
+#        PROD_GRAPH_SINGLE_KEY
+#        VERCEL_PROJECT_ID_PROD   Project ID of remko-prod
+#
+#      Testing site:
+#        TEST_CMS_URL             e.g. https://app-xxx.cmstest.optimizely.com/
+#        TEST_CLIENT_ID
+#        TEST_CLIENT_SECRET
+#        TEST_GRAPH_SECRET
+#        TEST_GRAPH_APP_KEY
+#        TEST_GRAPH_SINGLE_KEY
+#        TEST_CMS_API_URL         e.g. https://api.cmstest.optimizely.com/v1
+#        VERCEL_PROJECT_ID_TEST   Project ID of remko-test
+#
+#   3. Create the two deploy branches (once):
+#        git checkout --orphan main-prod && git push origin main-prod
+#        git checkout --orphan main-test && git push origin main-test
+#      The first workflow run will bootstrap saas-starter code
+#      onto the branch if package.json is not found.
+# ============================================================
+
+name: "[QA] Remko SDK — E2E Deploy to Vercel"
+
+on:
+  workflow_dispatch:
+    inputs:
+      site:
+        description: "Target site"
+        required: true
+        type: choice
+        options:
+          - production
+          - testing
+      sdk_branch:
+        description: "dxp-clients branch (empty = npm default, e.g. bugfix/CMS-50805-token-endpoint-v5)"
+        required: false
+        default: ""
+
+jobs:
+  deploy:
+    name: "Deploy [${{ inputs.site }}]"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout the site-specific deploy branch ────────────────────────────
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+          ref: ${{ inputs.site == 'production' && 'main-prod' || 'main-test' }}
+          fetch-depth: 0
+
+      # ── Node + corepack ─────────────────────────────────────────────────────
+      - name: Setup Node 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Enable corepack
+        run: corepack enable
+
+      # ── Bootstrap saas-starter (first run only) ─────────────────────────────
+      # When the deploy branch is empty (no package.json), scaffold the full
+      # optimizely-saas-starter template. All subsequent runs skip this step.
+      - name: Bootstrap saas-starter (first run only)
+        run: |
+          if [ ! -f package.json ]; then
+            echo "package.json not found — bootstrapping from template..."
+            corepack yarn create next-app \
+              -e https://github.com/remkoj/optimizely-saas-starter/tree/main \
+              /tmp/saas-starter
+            shopt -s dotglob
+            cp -r /tmp/saas-starter/. .
+            rm -rf /tmp/saas-starter
+            echo "Bootstrap done."
+          else
+            echo "package.json found — skipping bootstrap."
+          fi
+
+      # ── Write .env from secrets ─────────────────────────────────────────────
+      # .env is gitignored — written fresh each run from GitHub Secrets.
+      - name: Write .env
+        run: |
+          if [ "${{ inputs.site }}" = "production" ]; then
+            cat > .env <<'ENVEOF'
+          OPTIMIZELY_CMS_URL=${{ secrets.PROD_CMS_URL }}
+          OPTIMIZELY_CMS_CLIENT_ID=${{ secrets.PROD_CLIENT_ID }}
+          OPTIMIZELY_CMS_CLIENT_SECRET=${{ secrets.PROD_CLIENT_SECRET }}
+          OPTIMIZELY_GRAPH_SECRET=${{ secrets.PROD_GRAPH_SECRET }}
+          OPTIMIZELY_GRAPH_APP_KEY=${{ secrets.PROD_GRAPH_APP_KEY }}
+          OPTIMIZELY_GRAPH_SINGLE_KEY=${{ secrets.PROD_GRAPH_SINGLE_KEY }}
+          ENVEOF
+          else
+            cat > .env <<'ENVEOF'
+          OPTIMIZELY_CMS_URL=${{ secrets.TEST_CMS_URL }}
+          OPTIMIZELY_CMS_CLIENT_ID=${{ secrets.TEST_CLIENT_ID }}
+          OPTIMIZELY_CMS_CLIENT_SECRET=${{ secrets.TEST_CLIENT_SECRET }}
+          OPTIMIZELY_GRAPH_SECRET=${{ secrets.TEST_GRAPH_SECRET }}
+          OPTIMIZELY_GRAPH_APP_KEY=${{ secrets.TEST_GRAPH_APP_KEY }}
+          OPTIMIZELY_GRAPH_SINGLE_KEY=${{ secrets.TEST_GRAPH_SINGLE_KEY }}
+          OPTIMIZELY_CMS_API_URL=${{ secrets.TEST_CMS_API_URL }}
+          ENVEOF
+          fi
+          echo ".env written for site: ${{ inputs.site }}"
+
+      # ── Setup SDK from dxp-clients branch (optional) ────────────────────────
+      # When sdk_branch is provided: clones, builds, packs to .packages/*.tgz,
+      # and rewrites package.json to use file: paths (Vercel-compatible).
+      # When empty: uses whatever npm version the starter ships with.
+      - name: Setup SDK from dxp-clients branch
+        if: inputs.sdk_branch != ''
+        run: |
+          chmod +x scripts/ci-setup-sdk.sh
+          bash scripts/ci-setup-sdk.sh "${{ inputs.sdk_branch }}"
+
+      # ── Install ──────────────────────────────────────────────────────────────
+      - name: Install dependencies
+        run: corepack yarn install
+
+      # ── Generate content types ───────────────────────────────────────────────
+      - name: Generate content types (nextjs:create)
+        run: corepack yarn opti-cms nextjs:create
+
+      # ── Compile GraphQL ──────────────────────────────────────────────────────
+      - name: Compile GraphQL types
+        run: corepack yarn compile
+
+      # ── Next.js build ────────────────────────────────────────────────────────
+      # Validates the generated code compiles into a deployable Next.js app.
+      - name: Build
+        run: corepack yarn build
+
+      # ── Commit generated files → triggers Vercel auto-deploy ────────────────
+      - name: Commit and push
+        run: |
+          DEPLOY_BRANCH="${{ inputs.site == 'production' && 'main-prod' || 'main-test' }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # First commit vs subsequent run
+          if ! git rev-parse HEAD &>/dev/null 2>&1; then
+            # Empty branch — stage entire bootstrapped project
+            git add .
+            git commit -m "bootstrap: initial saas-starter [site=${{ inputs.site }}] [run #${{ github.run_number }}]"
+          else
+            # Clean out old generated dirs, re-add from this run
+            git rm -r --cached src/components/cms/ 2>/dev/null || true
+            git rm -r --cached src/gql/            2>/dev/null || true
+
+            git add -A src/components/cms/   2>/dev/null || true
+            git add -A src/gql/              2>/dev/null || true
+            git add    package.json yarn.lock 2>/dev/null || true
+            git add -A .packages/            2>/dev/null || true  # tarballs if sdk_branch used
+
+            if git diff --staged --quiet; then
+              echo "No generated files changed — skipping commit."
+            else
+              SDK_LABEL="${{ inputs.sdk_branch != '' && inputs.sdk_branch || 'npm-default' }}"
+              git commit -m "chore: regenerate [site=${{ inputs.site }}] [sdk=$SDK_LABEL] [run #${{ github.run_number }}]"
+            fi
+          fi
+
+          git push origin "$DEPLOY_BRANCH"
+
+      # ── Wait for Vercel deployment ────────────────────────────────────────────
+      - name: Wait for Vercel deployment
+        id: vercel
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+          VERCEL_PROJECT_ID: ${{ inputs.site == 'production' && secrets.VERCEL_PROJECT_ID_PROD || secrets.VERCEL_PROJECT_ID_TEST }}
+        run: |
+          PUSH_TIME=$(date -u +%s)
+          echo "Waiting for Vercel to deploy project $VERCEL_PROJECT_ID..."
+
+          DEPLOY_URL=""
+          for i in $(seq 1 36); do   # 36 × 10s = 6 min max
+            RESPONSE=$(curl -sf \
+              -H "Authorization: Bearer $VERCEL_TOKEN" \
+              "https://api.vercel.com/v6/deployments?projectId=$VERCEL_PROJECT_ID&teamId=$VERCEL_ORG_ID&limit=1&target=production" \
+              || echo '{}')
+
+            STATE=$(echo "$RESPONSE" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin).get('deployments',[]); print(d[0]['state'] if d else 'NONE')" \
+              2>/dev/null || echo "NONE")
+            URL=$(echo "$RESPONSE" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin).get('deployments',[]); print(d[0].get('url','') if d else '')" \
+              2>/dev/null || echo "")
+            CREATED_MS=$(echo "$RESPONSE" | python3 -c \
+              "import sys,json; d=json.load(sys.stdin).get('deployments',[]); print(d[0].get('createdAt',0) if d else 0)" \
+              2>/dev/null || echo "0")
+            CREATED_S=$(( CREATED_MS / 1000 ))
+
+            echo "  attempt $i: state=$STATE created=$CREATED_S push=$PUSH_TIME url=$URL"
+
+            if [ "$STATE" = "READY" ] && [ "$CREATED_S" -ge "$PUSH_TIME" ]; then
+              DEPLOY_URL="https://$URL"
+              echo "deploy_url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+              echo "Deployment ready: $DEPLOY_URL"
+              break
+            elif [ "$STATE" = "ERROR" ] && [ "$CREATED_S" -ge "$PUSH_TIME" ]; then
+              echo "Vercel deployment FAILED. Check the Vercel dashboard."
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          if [ -z "$DEPLOY_URL" ]; then
+            echo "Timed out waiting for Vercel. Check the dashboard manually."
+            echo "deploy_url=(check Vercel dashboard)" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── Job summary ───────────────────────────────────────────────────────────
+      - name: Job summary
+        if: always()
+        env:
+          CMS_URL: ${{ inputs.site == 'production' && secrets.PROD_CMS_URL || secrets.TEST_CMS_URL }}
+          DEPLOY_URL: ${{ steps.vercel.outputs.deploy_url }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## ✅ Remko SDK — E2E Deploy
+
+          | | |
+          |---|---|
+          | **Site** | ${{ inputs.site }} |
+          | **SDK** | ${{ inputs.sdk_branch != '' && inputs.sdk_branch || 'npm default' }} |
+          | **Vercel URL** | $DEPLOY_URL |
+          | **CMS Edit Mode** | ${CMS_URL}ui/cms/ |
+
+          ### Manual check steps
+          1. Open **CMS Edit Mode**: \`${CMS_URL}ui/cms/\`
+          2. Settings → Applications → verify frontend URL = \`$DEPLOY_URL\`
+          3. Navigate to any content page → confirm preview iframe loads
+          4. Edit a text field → confirm preview auto-updates
+          EOF
